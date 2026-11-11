@@ -1,0 +1,153 @@
+# Notes de référence du lab
+
+## Environnement (10/11/2026)
+
+| Outil | Version |
+|---|---|
+| kubectl (client) | v1.37.2 |
+| kind | v0.33.0 |
+| Kubernetes (node kind) | v1.37.0 |
+| Docker | 29.1.3 |
+| Terraform | 1.16.2 |
+| Crossplane (cible) | v2.4.3 |
+
+Machine : Ryzen 7 250, 16 threads, 29 Go de RAM, Ubuntu 25.10.
+
+---
+
+# Phase 1 : les bases de Kubernetes
+
+## 1. Le cluster
+
+Un cluster = un control plane + des nodes. Avec kind, chaque node est un conteneur Docker.
+
+| Composant | Où | Rôle |
+|---|---|---|
+| kube-apiserver | control plane | Point d'entrée unique (API REST). kubectl, controllers et nodes passent tous par lui. |
+| etcd | control plane | Base clé-valeur qui stocke l'état désiré de tous les objets. |
+| kube-scheduler | control plane | Choisit le node de chaque pod. |
+| kube-controller-manager | control plane | Fait tourner les boucles de réconciliation de base (ReplicaSet, Deployment...). |
+| kubelet | chaque node | Démarre réellement les conteneurs et remonte leur état. |
+| kube-proxy | chaque node | Traduit les Services en règles réseau (DNAT IP du Service vers IP des pods). |
+| coredns | `kube-system` | Résout les noms des Services (`web.lab-dev.svc.cluster.local`). |
+| kindnet | `kube-system` | CNI : attribue les IP des pods et route le trafic. |
+| local-path-provisioner | `local-path-storage` | Crée un PersistentVolume quand un PVC apparaît. |
+
+- Les composants du control plane tournent dans `kube-system`. On n'y déploie jamais ses applications.
+- Ce sont des static pods : le kubelet les lance à partir de fichiers sur le node, sans passer par l'apiserver.
+- L'apiserver est exposé sur `127.0.0.1:<port>` (port 6443 dans le conteneur). `kubectl cluster-info` le montre.
+- kubectl ne fait rien lui-même : il envoie des requêtes à l'apiserver, configuré via `~/.kube/config`.
+
+## 2. Objets, spec et status
+
+- Tout est un objet décrit en YAML : `apiVersion`, `kind`, `metadata`, `spec`, `status`.
+- `spec` = état désiré, écrit par l'utilisateur. `status` = état réel, écrit par le controller.
+- Le controller compare l'état réel à la `spec` stockée dans etcd, pas au fichier. Le fichier n'est lu qu'au moment de l'`apply`.
+- Les labels et selectors relient les objets entre eux (un Service trouve ses pods par leurs labels, pas par leur nom).
+
+## 3. La réconciliation
+
+Un controller observe l'état réel, le compare à l'état désiré, agit, met à jour le `status`, et recommence en boucle.
+
+Exemple observé : suppression d'un pod d'un Deployment à 2 réplicas.
+1. Le controller des ReplicaSets (dans kube-controller-manager) voit 1 pod au lieu de 2 et en crée un (`SuccessfulCreate`).
+2. Le scheduler le place sur un node.
+3. Le kubelet le démarre.
+
+Le tout en moins d'une seconde, sans action humaine. Le pod est remplacé, pas redémarré : nouveau nom, nouvelle IP. C'est pour cela qu'on passe toujours par un Service.
+
+Kubernetes réconcilie déjà seul ses propres objets. Crossplane étend ce mécanisme à des ressources extérieures au cluster.
+
+## 4. Workloads et Service
+
+Chaîne : Deployment → ReplicaSet → Pods. Le Service trouve les pods via son selector et publie leurs IP dans une EndpointSlice.
+
+- Le suffixe du ReplicaSet (`web-6d89d48dd7`) est une empreinte du template de pod. Changer l'image crée un nouveau ReplicaSet.
+- `port` : port sur lequel le Service écoute (les clients appellent `web:80`).
+- `targetPort` : port du conteneur vers lequel le trafic est redirigé. Les deux peuvent différer (80 vers 8080).
+- Plages d'adresses distinctes : Services en `10.96.x.x`, pods en `10.244.x.x`. L'IP d'un Service n'existe que dans les règles de kube-proxy.
+- Un selector qui ne trouve aucun pod n'est pas une erreur : le Service est créé, l'EndpointSlice reste vide, aucun avertissement.
+
+## 5. Mise à jour progressive (rolling update)
+
+- Par défaut, le Deployment crée au plus 1 pod en plus (`maxSurge`) et n'en retire aucun tant que le nouveau n'est pas Ready (`maxUnavailable` arrondi à 0 pour 2 réplicas).
+- Avec une image cassée : un seul nouveau pod en erreur, les anciens continuent de tourner, le site reste en ligne. La mise à jour est bloquée, sans coupure.
+- Kubernetes ne fait pas de rollback automatique. Il se bloque proprement et attend.
+- `BackOff` : le kubelet réessaie en espaçant les tentatives. Lui non plus ne renonce jamais.
+
+## 6. Fichier contre cluster
+
+- `kubectl rollout undo` remet la version précédente dans le cluster, mais ne touche pas au manifeste. Le prochain `apply` réintroduit la panne.
+- Règle : on répare d'abord le service (undo si urgence), puis la source de vérité (le fichier versionné), puis `apply`.
+- `kubectl diff -f fichier` montre l'écart entre fichier et cluster sans rien modifier. C'est l'équivalent le plus proche d'un `terraform plan`.
+- Un `apply` qui réussit ne prouve pas que l'application fonctionne : `apply` rend la main dès que la `spec` est enregistrée. Il faut vérifier avec `rollout status`, les pods et un test réel.
+- Lire la sortie de `apply` : `unchanged` = fichier et cluster d'accord. `configured` = quelque chose a changé. `created` = nouvel objet.
+
+## 7. Dry-run serveur
+
+- `kubectl apply -f fichier --dry-run=server` : l'apiserver valide chaque objet contre son schéma et contre l'état réel, mais n'enregistre rien.
+- Limite : sur un cluster neuf, il échoue (`namespaces "lab-dev" not found`) si le fichier crée un namespace et y place des objets, car le namespace est validé mais jamais créé.
+- Solutions pour la CI : créer les namespaces d'abord, les séparer dans un fichier, ou valider côté client avec kubeconform.
+
+## 8. Diagnostic
+
+### Ordre des commandes
+
+```bash
+kubectl get <type> -n <ns>                     # vue d'ensemble : READY, STATUS
+kubectl describe <type> <nom> -n <ns>          # conditions et Events en bas
+kubectl logs <pod> -n <ns> [--previous]        # sortie du programme (--previous : avant le dernier crash)
+kubectl get events -n <ns> --sort-by=.lastTimestamp
+kubectl get pods -n <ns> -w                    # suivre les changements en direct
+```
+
+### Service qui ne répond pas
+
+| Symptôme | Cause | Vérification |
+|---|---|---|
+| `bad address` | Le nom n'existe pas : faute de frappe, Service absent, mauvais namespace | `kubectl get svc -n <ns>` |
+| `connection refused` ou timeout | Le nom existe, personne derrière : selector qui ne correspond pas, ou mauvais `targetPort` | `kubectl get endpointslices -n <ns>` puis `kubectl get pods -n <ns> --show-labels` |
+
+### Pod qui ne démarre pas
+
+| Statut | Cause |
+|---|---|
+| `Pending` | Aucun node ne peut l'accueillir (ressources, PVC non satisfait) |
+| `ErrImagePull` puis `ImagePullBackOff` | Image introuvable. Lire le message : `NotFound` (tag absent), `unauthorized` (identifiants, imagePullSecret), `timeout` (réseau ou DNS vers le registre) |
+| `CrashLoopBackOff` | Le conteneur démarre puis meurt en boucle : lire `logs --previous` |
+| `OOMKilled` | Limite mémoire dépassée |
+
+Un nom d'image court (`nginx`) est complété en `docker.io/library/nginx`.
+
+### Tester depuis l'intérieur du cluster
+
+```bash
+kubectl run test --rm -it --image=busybox:1.37 -n <ns> --restart=Never -- wget -qO- -T 5 http://<service>
+```
+
+### Outils divers
+
+- `kubectl explain <type>.<champ>` : documentation d'un champ, depuis le cluster.
+- `kubectl api-resources` : tous les types et leurs abréviations (`deploy`, `svc`, `rs`...).
+
+### Shell
+
+`command not found` après une installation : le fichier existe-t-il (`ls`) ? son dossier est-il dans le PATH (`which`, `echo $PATH`) ?
+
+---
+
+## Pistes pour le benchmark
+
+| Critère | Ce que la phase 1 a montré |
+|---|---|
+| Dérive | Kubernetes recrée seul un pod supprimé. Terraform ne réagit qu'au prochain `plan`. |
+| État | Après un `rollout undo`, fichier et cluster divergent. Question à trancher : qui fait foi ? |
+| Dégradation | Une mise à jour cassée se bloque sans coupure et sans rollback automatique. |
+| Observabilité | Les erreurs de câblage (selector) sont silencieuses : objet valide, application muette. |
+| Prévisualisation | `kubectl diff` existe, mais le dry-run serveur ne gère pas les dépendances internes à un fichier. `terraform plan` raisonne sur un graphe. |
+
+## Mesures
+
+| Date | Situation | RAM conteneur kind | Méthode |
+|---|---|---|---|
+| 10/11/2026 | Cluster vide, kind v0.33, 1 node | 579 Mo | `docker stats --no-stream` |
