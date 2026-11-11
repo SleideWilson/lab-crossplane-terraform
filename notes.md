@@ -151,3 +151,83 @@ kubectl run test --rm -it --image=busybox:1.37 -n <ns> --restart=Never -- wget -
 | Date | Situation | RAM conteneur kind | Méthode |
 |---|---|---|---|
 | 10/11/2026 | Cluster vide, kind v0.33, 1 node | 579 Mo | `docker stats --no-stream` |
+| 11/11/2026 | web (2 pods nginx) + postgres (1 pod), 1 node | 1,19 Go | `docker stats --no-stream` |
+
+---
+
+# Phase 2 : base persistante, réseau et droits
+
+## 1. StatefulSet
+
+Pourquoi PostgreSQL dans un StatefulSet et pas un Deployment :
+- **Identité stable** : le pod s'appelle `postgres-0` et garde ce nom après recréation (un Deployment génère des noms aléatoires).
+- **Un disque par pod, attaché au nom** : `volumeClaimTemplates` crée un PVC `<template>-<pod>`, ici `data-postgres-0`. Le nouveau `postgres-0` récupère le même PVC, donc les mêmes données.
+- **Ordre** : démarrage et arrêt dans l'ordre (0, 1, 2...), utile pour un primaire et des réplicas.
+- Avec un Deployment et un seul PVC `ReadWriteOnce`, la mise à jour progressive crée le nouveau pod avant de supprimer l'ancien : les deux réclament le même disque.
+
+Un StatefulSet exige un **Service headless** (`clusterIP: None`) : pas d'IP virtuelle, coredns renvoie directement l'IP du pod, et chaque pod a un nom DNS propre (`postgres-0.postgres`).
+
+Vérifié : table créée, pod supprimé, pod recréé, `SELECT` renvoie toujours la ligne.
+
+## 2. Stockage
+
+Chaîne : PVC (la demande) → StorageClass `standard` → local-path-provisioner → PV (le volume réel, un dossier sur le disque du node).
+
+- Toujours vérifier où l'image écrit ses données avant de choisir le `mountPath` :
+  `docker inspect <image> --format '{{json .Config.Env}}'` (PGDATA) et `--format '{{json .Config.Volumes}}'`.
+- PostgreSQL 18 : `PGDATA=/var/lib/postgresql/18/docker`, on monte `/var/lib/postgresql`. Monter l'ancien chemin `/var/lib/postgresql/data` donnerait une base qui perd ses données au redémarrage, sans aucune erreur.
+- `RECLAIM POLICY: Delete` : supprimer le PVC supprime le PV et les données.
+- Supprimer un StatefulSet **ne supprime pas** ses PVC (prudence de Kubernetes).
+- Supprimer le **namespace** supprime tout ce qu'il contient, PVC compris, donc les données (reclaim Delete). Recréer le namespace ne les ramène pas.
+- Équivalent Crossplane : `deletionPolicy: Delete` ou `Orphan` sur une ressource managée.
+
+## 3. Secret
+
+- Un Secret est encodé en base64, **pas chiffré** : `kubectl get secret <nom> -o jsonpath='{.data.<clé>}' | base64 -d` le lit en clair.
+- Ce qui le protège réellement : le RBAC (qui a le droit `get secrets` dans le namespace).
+- Le pod le lit via `env.valueFrom.secretKeyRef` (nom du Secret + clé).
+- Le mot de passe est en clair dans `postgres.yml` versionné : acceptable pour un lab, à ne jamais faire en vrai. Même problème que les secrets dans un `tfstate`.
+
+## 4. NetworkPolicy
+
+- `podSelector` = les pods **protégés**. `ingress.from.podSelector` = les pods **autorisés** à entrer.
+- Par défaut le réseau est **ouvert** : tous les pods se parlent. Dès qu'une NetworkPolicy sélectionne un pod, tout ce qui n'est pas autorisé est bloqué pour lui (liste blanche).
+- L'apiserver accepte toujours une NetworkPolicy, même si le CNI ne sait pas l'appliquer. Seul un test le prouve.
+- **Vérifié avec kindnet** (kind v0.33) : intrus accepté sans la règle, bloqué avec. Les NetworkPolicy sont appliquées.
+- Le trafic bloqué est **jeté** (DROP) : le client attend jusqu'au délai (`no response`).
+
+## 5. ServiceAccount et RBAC
+
+| Objet | Rôle |
+|---|---|
+| ServiceAccount | Identité d'un programme (`system:serviceaccount:<ns>:<nom>`) |
+| Role / ClusterRole | Liste de permissions verbe + ressource, dans un namespace / dans tout le cluster |
+| RoleBinding / ClusterRoleBinding | Attribue un rôle à une identité |
+
+- Le RBAC est **toujours fermé par défaut** : sans binding, aucun droit, même en lecture.
+- À l'inverse, le réseau est ouvert par défaut tant qu'aucune NetworkPolicy ne sélectionne le pod.
+- `apiGroups: [""]` = groupe de base (pods, services, secrets, configmaps).
+- Vérifié : compte `lecteur` sans RBAC `no no no no`, avec le rôle `lire-pods` `yes no no no` (list pods oui ; delete pods, get secrets, autre namespace non).
+- Piège : `--as=$SA` avec une variable vide teste ta propre identité (admin) et répond `yes` partout. Toujours vérifier l'identité testée.
+
+## 6. Diagnostic, ajouts de la phase 2
+
+| Symptôme | Première hypothèse | Vérification |
+|---|---|---|
+| Délai dépassé (`no response`, timeout) vers un pod `Running` | NetworkPolicy qui bloque, ou labels du client qui ne correspondent pas au `from` | `kubectl get networkpolicy -n <ns>`, `kubectl describe networkpolicy <nom> -n <ns>`, `kubectl get pod <client> -n <ns> --show-labels` |
+| Refus immédiat (`connection refused`) | Service sans endpoint ou mauvais port | `kubectl get endpointslices -n <ns>` |
+| `<ressource> is forbidden` | Le ServiceAccount n'a pas le droit | `kubectl auth can-i <verbe> <ressource> -n <ns> --as=system:serviceaccount:<ns>:<sa>` |
+| Données perdues après redémarrage | Mauvais `mountPath` | `kubectl exec <pod> -- sh -c 'echo $PGDATA'` comparé au `mountPath` |
+
+Retrouver le ServiceAccount d'un pod : `kubectl get pod <pod> -n <ns> -o jsonpath='{.spec.serviceAccountName}'`.
+
+Commandes utiles : `kubectl exec -it <pod> -- <cmd>` (commande dans le conteneur), `kubectl wait --for=condition=Ready pod/<pod>` (attendre une condition), `kubectl run ... --labels=app=x` (pod de test avec un label choisi).
+
+## Pistes pour le benchmark (phase 2)
+
+| Critère | Ce que la phase 2 a montré |
+|---|---|
+| Suppression | Supprimer un namespace emporte les données (PVC en reclaim Delete). Même risque que supprimer une XR ou un Claim avec `deletionPolicy: Delete`. |
+| Sécurité de l'état | Secrets lisibles par quiconque a `get secrets`. Le tfstate pose le même problème côté Terraform. |
+| Observabilité | NetworkPolicy et RBAC acceptés sans validation de leur effet réel : il faut des tests actifs. |
+| Abstraction | Une seule variante dev = 4 fichiers et une dizaine d'objets. Ce sont eux que la Composition et le module Terraform devront générer. |

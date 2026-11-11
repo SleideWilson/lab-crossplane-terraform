@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: lecteur
+  namespace: lab-dev
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: lire-pods
+  namespace: lab-dev
+rules:
+- apiGroups: [""]            # "" = groupe de base (pods, services, secrets...)
+  resources: ["pods"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: lecteur-lire-pods
+  namespace: lab-dev
+subjects:                    # QUI reçoit le droit
+- kind: ServiceAccount
+  name: lecteur
+  namespace: lab-dev
+roleRef:                     # QUEL rôle
+  kind: Role
+  name: lire-pods
+  apiGroup: rbac.authorization.k8s.io
