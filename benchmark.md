@@ -20,9 +20,9 @@ dans quels cas Crossplane est-il préférable à Terraform, et inversement ?
 | Ressource | dev | prod |
 |---|---|---|
 | Réseau : namespace + NetworkPolicy | web vers postgres autorisé | idem + refus par défaut du reste |
-| Base : PostgreSQL | 1 instance, 1 Gi | 1 instance, 5 Gi, limites CPU/RAM |
+| Serveur PostgreSQL | 1 instance, 1 Gi | 1 instance, 5 Gi, limites CPU/RAM |
 | Service : web | 1 réplica | 3 réplicas |
-| Bucket : MinIO | 1 bucket | 1 bucket, versioning activé |
+| Base applicative : base + compte SQL, créés par l'API de PostgreSQL | 1 base, 1 compte | 1 base, 1 compte avec limite de connexions |
 
 ## Grille
 
@@ -44,8 +44,8 @@ Les numéros sont stables : ils ne suivent pas l'ordre des familles.
 
 | # | Critère | Type | Priorité | Scénario | Unité |
 |---|---|---|---|---|---|
-| 1 | Dérive | M | P | Modifier à la main les réplicas de web, puis supprimer le bucket | secondes, action humaine oui/non, extrait de log |
-| 4 | Dégradation et reprise | M | P | Le bucket échoue (MinIO arrêté), puis retour arrière | état des 3 autres ressources, étapes du retour |
+| 1 | Dérive | M | P | Modifier à la main les réplicas de web, puis supprimer la base applicative | secondes, action humaine oui/non, extrait de log |
+| 4 | Dégradation et reprise | M | P | La base applicative échoue (accès à PostgreSQL refusé), puis retour arrière | état des 3 autres ressources, étapes du retour |
 | 6 | Suppression | M | | Supprimer la pile dev entière | ce qui disparaît, ce qui reste |
 | 5 | Observabilité | J | | Pendant le scénario 4 | nombre de commandes pour trouver la cause |
 | 7 | Prévisualisation | M | | Voir un changement avant de l'appliquer | oui/non, information affichée |
@@ -78,8 +78,8 @@ Les commandes Crossplane exactes seront confirmées à l'installation (phase 3).
 
 ### 1. Dérive
 
-- **Geste** : `kubectl scale deploy/web --replicas=5` à la main. Puis, séparément, suppression du bucket avec le client MinIO.
-- **Observation** : chronomètre entre le geste et le retour à la valeur du code (`kubectl get deploy web -w`, liste des buckets).
+- **Geste** : `kubectl scale deploy/web --replicas=5` à la main. Puis, séparément, suppression de la base applicative avec `psql` (`DROP DATABASE`).
+- **Observation** : chronomètre entre le geste et le retour à la valeur du code (`kubectl get deploy web -w`, liste des bases avec `psql -c '\l'`).
 - **Des deux côtés** : même geste. Côté Terraform, attendre 10 minutes sans rien faire, puis noter ce que montre `terraform plan`.
 - **Ce que je note** : délai de correction, action humaine nécessaire ou non, ligne de log ou d'événement qui signale la dérive.
 - **Ce qui peut fausser** : l'intervalle de réconciliation de Crossplane est configurable. Je note la valeur utilisée (celle par défaut).
@@ -102,23 +102,23 @@ Les commandes Crossplane exactes seront confirmées à l'installation (phase 3).
 
 ### 4. Dégradation
 
-- **Geste** : arrêter MinIO (`kubectl scale` à 0), puis créer une pile neuve. Le bucket ne peut pas être créé.
+- **Geste** : mettre un mauvais mot de passe dans les identifiants que l'outil utilise pour PostgreSQL, puis créer une pile neuve. La base applicative ne peut pas être créée.
 - **Observation après 2 minutes** : état des 3 autres ressources (créées ou non, fonctionnelles ou non), état global affiché par l'outil.
-- **Reprise** : redémarrer MinIO. Chronomètre jusqu'à la pile complète. Action humaine nécessaire ou non.
+- **Reprise** : remettre le bon mot de passe. Chronomètre jusqu'à la pile complète. Action humaine nécessaire ou non.
 - **Retour arrière** : revenir au commit précédent et appliquer. Nombre d'étapes, état final.
 
 ### 5. Observabilité
 
 - **Point de départ identique** : pendant le scénario 4, je sais seulement que « la pile n'est pas prête ».
-- **Mesure** : nombre de commandes jusqu'au message qui nomme la cause (MinIO injoignable). Je note la liste des commandes.
+- **Mesure** : nombre de commandes jusqu'au message qui nomme la cause (authentification refusée par PostgreSQL). Je note la liste des commandes.
 - **Ce que je note aussi** : le message cite-t-il la cause en clair ? Peut-on suivre l'avancement pendant le déploiement ?
 - **Limite** : c'est un jugement. Je connais le cluster, un nouveau venu mettrait plus de temps.
 
 ### 6. Suppression
 
-- **Préparation** : une ligne dans une table PostgreSQL, un fichier dans le bucket.
+- **Préparation** : une table avec une ligne dans la base applicative.
 - **Geste** : supprimer la XR dev, ou `terraform destroy` sur dev.
-- **Vérification** : `kubectl get all,pvc,networkpolicy,secret -n lab-dev`, `kubectl get pv`, liste des buckets.
+- **Vérification** : `kubectl get all,pvc,networkpolicy,secret -n lab-dev`, `kubectl get pv`, liste des bases si le serveur existe encore.
 - **Ce que je note** : durée, confirmation demandée ou non, ce qui reste, sort des données.
 - **Second passage** : avec la protection de chaque outil (`deletionPolicy: Orphan`, `prevent_destroy`). Ce qui change.
 
@@ -154,16 +154,16 @@ nombre de CRD et charge de l'apiserver, organisation des équipes. Présenté co
 
 ### 12. Coexistence et migration
 
-- **Préparation** : Terraform crée un bucket. J'y dépose un fichier et je note sa date de création.
+- **Préparation** : Terraform crée une base applicative. J'y crée une table avec une ligne et je note l'identifiant interne de la base (`SELECT oid FROM pg_database WHERE datname = '...'`).
 - **Étape 1** : Crossplane le déclare en observation seule (`external-name` + `managementPolicies: ["Observe"]`). Vérifier que son état remonte dans `status.atProvider`.
 - **Étape 2** : passage en gestion complète.
-- **Étape 3** : retrait du bucket de l'état Terraform sans le détruire (`terraform state rm`).
-- **Preuve à chaque étape** : le fichier est toujours là, la date de création n'a pas changé. Donc la ressource n'a pas été recréée.
+- **Étape 3** : retrait de la base de l'état Terraform sans le détruire (`terraform state rm`).
+- **Preuve à chaque étape** : la ligne est toujours là, l'identifiant interne n'a pas changé. Donc la base n'a pas été recréée.
 - **Ce que je note** : nombre d'étapes, risques à chaque étape (deux outils qui gèrent la même ressource en même temps).
 
 ### 13. Ordonnancement et dépendances
 
-- **Dépendances de la pile** : web a besoin de la base prête et de son mot de passe. Le bucket a besoin de MinIO. Tout a besoin du namespace.
+- **Dépendances de la pile** : web a besoin de la base prête et de son mot de passe. La base applicative a besoin du serveur PostgreSQL prêt et joignable. Tout a besoin du namespace.
 - **Geste** : créer une pile neuve, sans rien préparer.
 - **Mesure** : ordre réel de création (`kubectl get <types> -n <ns> --sort-by=.metadata.creationTimestamp`), nombre d'erreurs transitoires et de redémarrages de pods avant convergence, durée jusqu'à la pile prête.
 - **Ce que je note** : comment la dépendance s'écrit dans le code (référence, `depends_on`, condition de disponibilité), et comment une valeur produite par une ressource (mot de passe, adresse) arrive à une autre.
@@ -199,7 +199,7 @@ Je décris ce qu'il faudrait écrire dans chaque cas. Pas de mesure.
 ## Hors périmètre
 
 - L'outil maison d'OUTSCALE : pas d'accès. Section de raisonnement dans la conclusion, avec la même grille.
-- Les API IaaS réelles (AWS, OpenStack, OUTSCALE) : remplacées par des ressources Kubernetes et MinIO.
+- Les API IaaS réelles (AWS, OpenStack, OUTSCALE) : remplacées par des ressources Kubernetes et par l'API SQL de PostgreSQL.
 - Le multi-région et le multi-fournisseur : un cluster local à un node ne permet aucune conclusion honnête.
 
 ## Méthode de choix des critères
@@ -215,4 +215,5 @@ Dans un cadre réel, les critères et leur poids seraient fixés avec l'équipe 
 
 | Date | Changement | Raison |
 |---|---|---|
+| 12/11/2026 | Quatrième ressource : le bucket MinIO est remplacé par une base applicative et son compte, créés dans PostgreSQL (provider-sql côté Crossplane, provider postgresql côté Terraform). Scénarios 1, 4, 6, 12 et 13 adaptés. | Vérification avant installation : le dépôt MinIO est archivé (dernière release en octobre 2025) et provider-minio n'a pas eu de release depuis juillet 2025. Aucune mesure n'avait été prise. Constat reporté au critère 10. |
 | 11/11/2026 | Ajout des critères 13 à 16, des droits dans le critère 3, des familles A à E et des priorités | Relecture de la grille avant toute mesure : l'ordonnancement et l'évolution d'une classe, au cœur de l'offre, n'étaient pas testés |

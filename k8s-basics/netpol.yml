@@ -14,6 +14,12 @@ spec:
     - podSelector:        # QUI a le droit d'entrer
         matchLabels:
           app: web
+    - namespaceSelector:  # ET le provider Crossplane, qui vit dans un autre namespace
+        matchLabels:
+          kubernetes.io/metadata.name: crossplane-system
+      podSelector:        # même élément de liste que namespaceSelector : les deux conditions à la fois
+        matchLabels:
+          pkg.crossplane.io/provider: provider-sql
     ports:
     - protocol: TCP
       port: 5432

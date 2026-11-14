@@ -1,0 +1,10 @@
+apiVersion: postgresql.sql.m.crossplane.io/v1alpha1
+kind: Database
+metadata:
+  name: shop
+  namespace: lab-dev
+spec:
+  forProvider: {}
+  providerConfigRef:
+    kind: ProviderConfig
+    name: default
