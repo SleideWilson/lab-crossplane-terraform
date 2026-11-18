@@ -63,6 +63,7 @@ spec:
           - type: map
             map:
               small: 1
+              medium: 2
               large: 3
         # dans l'autre sens : on remonte les réplicas disponibles dans le status de l'AppStack
         - type: ToCompositeFieldPath

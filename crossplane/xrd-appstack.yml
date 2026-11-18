@@ -22,9 +22,9 @@ spec:
             type: object
             properties:
               size:
-                description: Taille de la pile. small = 1 réplica web, large = 3.
+                description: Taille de la pile. small = 1 réplica web, medium = 2, large = 3.
                 type: string
-                enum: [small, large]   # toute autre valeur est rejetée par l'apiserver
+                enum: [small, medium, large]   # toute autre valeur est rejetée par l'apiserver
             required:
             - size
           status:                      # ce que Crossplane remonte à l'équipe
