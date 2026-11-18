@@ -1,0 +1,7 @@
+apiVersion: lab.rcloudh.com/v1alpha1
+kind: AppStack
+metadata:
+  name: shop-prod
+  namespace: lab-dev
+spec:
+  size: large

@@ -1,0 +1,8 @@
+# Ce qu'écrit l'équipe applicative. C'est tout.
+apiVersion: lab.rcloudh.com/v1alpha1
+kind: AppStack
+metadata:
+  name: shop-dev
+  namespace: lab-dev
+spec:
+  size: small

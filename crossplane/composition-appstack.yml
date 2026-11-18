@@ -1,0 +1,127 @@
+# La Composition : la recette qui transforme une AppStack en ressources réelles.
+# Écrite par l'équipe plateforme. L'équipe applicative ne la voit jamais.
+apiVersion: apiextensions.crossplane.io/v1
+kind: Composition
+metadata:
+  name: appstack
+spec:
+  compositeTypeRef:                    # "je sais construire des AppStack"
+    apiVersion: lab.rcloudh.com/v1alpha1
+    kind: AppStack
+  mode: Pipeline
+  pipeline:
+  - step: compose-stack
+    functionRef:
+      name: function-patch-and-transform
+    input:
+      apiVersion: pt.fn.crossplane.io/v1beta1
+      kind: Resources
+      resources:
+
+      # 1. Le service web
+      - name: web
+        base:                          # le modèle de départ, complété par les patches
+          apiVersion: apps/v1
+          kind: Deployment
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                role: web
+            template:
+              metadata:
+                labels:
+                  role: web
+              spec:
+                containers:
+                - name: web
+                  image: nginx:1.29-alpine
+                  ports:
+                  - containerPort: 80
+        patches:
+        # nom du Deployment = nom de l'AppStack + "-web"
+        - type: FromCompositeFieldPath
+          fromFieldPath: metadata.name
+          toFieldPath: metadata.name
+          transforms:
+          - type: string
+            string:
+              type: Format
+              fmt: "%s-web"
+        # un label avec le nom de la pile, pour que chaque Service ne voie que ses propres pods
+        - type: FromCompositeFieldPath
+          fromFieldPath: metadata.name
+          toFieldPath: spec.selector.matchLabels[lab.rcloudh.com/stack]
+        - type: FromCompositeFieldPath
+          fromFieldPath: metadata.name
+          toFieldPath: spec.template.metadata.labels[lab.rcloudh.com/stack]
+        # la taille devient un nombre de réplicas
+        - type: FromCompositeFieldPath
+          fromFieldPath: spec.size
+          toFieldPath: spec.replicas
+          transforms:
+          - type: map
+            map:
+              small: 1
+              large: 3
+        # dans l'autre sens : on remonte les réplicas disponibles dans le status de l'AppStack
+        - type: ToCompositeFieldPath
+          fromFieldPath: status.availableReplicas
+          toFieldPath: status.webReplicas
+        readinessChecks:               # "prêt" = le Deployment est Available
+        - type: MatchCondition
+          matchCondition:
+            type: Available
+            status: "True"
+
+      # 2. Le Service devant le web
+      - name: web-svc
+        base:
+          apiVersion: v1
+          kind: Service
+          spec:
+            selector:
+              role: web
+            ports:
+            - port: 80
+              targetPort: 80
+        patches:
+        - type: FromCompositeFieldPath
+          fromFieldPath: metadata.name
+          toFieldPath: metadata.name
+          transforms:
+          - type: string
+            string:
+              type: Format
+              fmt: "%s-web"
+        - type: FromCompositeFieldPath
+          fromFieldPath: metadata.name
+          toFieldPath: spec.selector[lab.rcloudh.com/stack]
+        readinessChecks:               # un Service n'a pas de condition Ready : on vérifie qu'il a une IP
+        - type: NonEmpty
+          fieldPath: spec.clusterIP
+
+      # 3. La base applicative, dans le serveur PostgreSQL partagé (ressource managée de provider-sql)
+      - name: database
+        base:
+          apiVersion: postgresql.sql.m.crossplane.io/v1alpha1
+          kind: Database
+          spec:
+            forProvider: {}
+            providerConfigRef:
+              kind: ProviderConfig
+              name: default
+        patches:
+        # nom de la base dans PostgreSQL = nom de l'AppStack, avec "_" à la place de "-"
+        # (external-name = le nom de la ressource côté système externe)
+        - type: FromCompositeFieldPath
+          fromFieldPath: metadata.name
+          toFieldPath: metadata.annotations[crossplane.io/external-name]
+          transforms:
+          - type: string
+            string:
+              type: Replace
+              replace:
+                search: "-"
+                replace: "_"
+        # pas de readinessChecks : par défaut, prêt = condition Ready de la ressource managée

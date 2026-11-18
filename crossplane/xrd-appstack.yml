@@ -1,0 +1,35 @@
+# Le XRD : définit le nouveau type AppStack et ce qu'une équipe a le droit d'y écrire.
+# Crossplane en génère une CRD. Ce fichier ne crée aucune ressource.
+apiVersion: apiextensions.crossplane.io/v2
+kind: CompositeResourceDefinition
+metadata:
+  name: appstacks.lab.rcloudh.com      # doit valoir <plural>.<group>
+spec:
+  scope: Namespaced                    # une AppStack vit dans le namespace d'une équipe
+  group: lab.rcloudh.com
+  names:
+    kind: AppStack
+    plural: appstacks
+  versions:
+  - name: v1alpha1
+    served: true
+    referenceable: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:                        # ce que l'équipe écrit
+            type: object
+            properties:
+              size:
+                description: Taille de la pile. small = 1 réplica web, large = 3.
+                type: string
+                enum: [small, large]   # toute autre valeur est rejetée par l'apiserver
+            required:
+            - size
+          status:                      # ce que Crossplane remonte à l'équipe
+            type: object
+            properties:
+              webReplicas:
+                description: Nombre de réplicas web disponibles.
+                type: integer
