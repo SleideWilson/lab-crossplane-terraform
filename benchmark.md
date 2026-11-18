@@ -190,6 +190,26 @@ Je décris ce qu'il faudrait écrire dans chaque cas. Pas de mesure.
 - **Sources** : dépôts officiels, annonces des éditeurs, site de la CNCF. Date de consultation notée.
 - **Aucune affirmation de mémoire** : chaque fait est vérifié à la source au moment de la rédaction.
 
+## Résultats
+
+### Critère 2, abstraction : côté Crossplane (18/11/2026)
+
+Crossplane 2.4.3, function-patch-and-transform v0.11.2. Variante ajoutée : `medium` (2 réplicas web).
+Mesure : `git diff --numstat` entre les commits `eb3a8d7` et `7aa38e1`.
+
+| Qui | Fichier | Lignes ajoutées | Lignes supprimées | Changement utile |
+|---|---|---|---|---|
+| Équipe plateforme | `xrd-appstack.yml` | 2 | 2 | `medium` ajouté à l'`enum` (l'autre ligne est la description) |
+| Équipe plateforme | `composition-appstack.yml` | 1 | 0 | `medium: 2` dans la table du patch |
+| Équipe applicative | `xr-shop-staging.yml` (nouveau) | 8 | 0 | la demande elle-même, `size: medium` |
+
+- **Plateforme : 2 fichiers, 2 lignes utiles.** Les deux sont obligatoires : sans l'`enum`, l'apiserver refuse la demande ; sans la table, la demande n'est pas traduite.
+- **Équipe applicative : 1 fichier de 8 lignes,** sans rien savoir des Deployments ni de PostgreSQL.
+- **Résultat obtenu :** `shop-staging` READY, Deployment `2/2`, base `shop_staging` créée.
+- **Effet sur l'existant :** les Deployments de dev et de prod n'ont pas été modifiés (`metadata.generation` toujours à 1). Changer la Composition a pourtant déclenché une réconciliation de toutes les AppStack : sans effet ici, puisque leur rendu ne change pas. À approfondir au critère 14.
+- **Mesuré une fois.** Le résultat est déterministe (un diff), la répétition n'apporte rien.
+- **À comparer** avec le même ajout côté Terraform (phase 6).
+
 ## Biais connus
 
 - Crossplane est construit en premier, Terraform en second : le second profite de ce que j'ai appris sur le premier. Effet limité, car je pratiquais déjà Terraform.
